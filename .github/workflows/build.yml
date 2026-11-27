@@ -1,0 +1,171 @@
+name: Final Build
+
+on: [push, workflow_dispatch]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Unzip Source
+      run: |
+        unzip *.zip -d src
+        mv src/* .
+
+    - name: Inject Fixed AES Code
+      run: |
+        # 这里直接指定了文件路径，避免乱找
+        cat << 'EOF' > core/auth/src/main/kotlin/io/github/gcbond/openhc/core/auth/crypto/AuthCrypto.kt
+        package io.github.gcbond.openhc.core.auth.crypto
+
+        import org.bouncycastle.math.ec.rfc7748.X25519
+        import org.bouncycastle.math.ec.rfc8032.Ed25519
+        import java.math.BigInteger
+        import java.security.MessageDigest
+        import javax.crypto.Mac
+        import javax.crypto.spec.SecretKeySpec
+        import org.bouncycastle.crypto.InvalidCipherTextException
+        import org.bouncycastle.crypto.engines.AESEngine
+        import org.bouncycastle.crypto.modes.GCMBlockCipher
+        import org.bouncycastle.crypto.modes.GCMModeCipher
+        import org.bouncycastle.crypto.params.AEADParameters
+        import org.bouncycastle.crypto.params.KeyParameter
+
+        internal object Sha256 {
+            fun digest(vararg parts: ByteArray): ByteArray {
+                val md = MessageDigest.getInstance("SHA-256")
+                for (part in parts) md.update(part)
+                return md.digest()
+            }
+        }
+
+        internal object HmacSha256 {
+            const val LENGTH = 32
+            fun mac(key: ByteArray, data: ByteArray): ByteArray {
+                val mac = Mac.getInstance("HmacSHA256")
+                mac.init(SecretKeySpec(if (key.isEmpty()) ByteArray(1) else key, "HmacSHA256"))
+                return mac.doFinal(data)
+            }
+        }
+
+        internal object Hkdf {
+            fun sha256(ikm: ByteArray, salt: ByteArray, info: ByteArray, length: Int): ByteArray {
+                val prk = HmacSha256.mac(salt, ikm)
+                val out = ByteArray(length)
+                var previous = ByteArray(0)
+                var offset = 0
+                var counter = 1
+                while (offset < length) {
+                    previous = HmacSha256.mac(prk, previous + info + byteArrayOf(counter.toByte()))
+                    val n = minOf(previous.size, length - offset)
+                    System.arraycopy(previous, 0, out, offset, n)
+                    offset += n
+                    counter++
+                }
+                return out
+            }
+        }
+
+        internal object AesGcm {
+            const val TAG_LENGTH = 16
+            fun encrypt(key: ByteArray, nonce: ByteArray, aad: ByteArray, plain: ByteArray): ByteArray {
+                val cipher: GCMModeCipher = GCMBlockCipher.newInstance(AESEngine.newInstance())
+                val params = AEADParameters(KeyParameter(key), TAG_LENGTH * 8, nonce, if (aad.isEmpty()) null else aad)
+                cipher.init(true, params)
+                val out = ByteArray(cipher.getOutputSize(plain.size))
+                var len = cipher.processBytes(plain, 0, plain.size, out, 0)
+                len += cipher.doFinal(out, len)
+                return out.copyOf(len)
+            }
+            fun decrypt(key: ByteArray, nonce: ByteArray, aad: ByteArray, cipherAndTag: ByteArray): ByteArray? {
+                if (key.size != 16 && key.size != 24 && key.size != 32) return null
+                if (nonce.isEmpty() || cipherAndTag.size < TAG_LENGTH) return null
+                return try {
+                    val cipher: GCMModeCipher = GCMBlockCipher.newInstance(AESEngine.newInstance())
+                    val params = AEADParameters(KeyParameter(key), TAG_LENGTH * 8, nonce, if (aad.isEmpty()) null else aad)
+                    cipher.init(false, params)
+                    val out = ByteArray(cipher.getOutputSize(cipherAndTag.size))
+                    var len = cipher.processBytes(cipherAndTag, 0, cipherAndTag.size, out, 0)
+                    len += cipher.doFinal(out, len)
+                    out.copyOf(len)
+                } catch (e: Exception) { null }
+            }
+        }
+
+        internal object Modp {
+            const val LENGTH_3072 = 384
+            const val LENGTH_2048 = 256
+            val P3072: BigInteger = BigInteger("FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200CBBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A93AD2CAFFFFFFFFFFFFFFFF", 16)
+            val P2048: BigInteger = BigInteger("FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AACAA68FFFFFFFFFFFFFFFF", 16)
+            fun prime(length: Int): BigInteger = when (length) { LENGTH_3072 -> P3072; LENGTH_2048 -> P2048; else -> throw IllegalArgumentException() }
+            fun modPow(base: ByteArray, exponent: ByteArray, length: Int): ByteArray {
+                val result = BigInteger(1, base).modPow(BigInteger(1, exponent), prime(length))
+                val raw = result.toByteArray()
+                val start = if (raw.size > 1 && raw[0].toInt() == 0) 1 else 0
+                val out = ByteArray(length)
+                System.arraycopy(raw, start, out, length - (raw.size - start), raw.size - start)
+                return out
+            }
+            fun isValidPublicValue(value: ByteArray, length: Int): Boolean {
+                if (value.size > length) return false
+                val v = BigInteger(1, value)
+                return v > BigInteger.ONE && v < prime(length).subtract(BigInteger.ONE)
+            }
+        }
+
+        internal object Ed25519Keys {
+            const val KEY_LENGTH = 32
+            const val SIGNATURE_LENGTH = 64
+            fun publicKey(seed: ByteArray): ByteArray {
+                val pk = ByteArray(KEY_LENGTH)
+                Ed25519.generatePublicKey(seed, 0, pk, 0)
+                return pk
+            }
+            fun sign(seed: ByteArray, message: ByteArray): ByteArray {
+                val signature = ByteArray(SIGNATURE_LENGTH)
+                Ed25519.sign(seed, 0, message, 0, message.size, signature, 0)
+                return signature
+            }
+            fun verify(publicKey: ByteArray, message: ByteArray, signature: ByteArray): Boolean {
+                if (publicKey.size != KEY_LENGTH || signature.size != SIGNATURE_LENGTH) return false
+                return try { Ed25519.verify(signature, 0, publicKey, 0, message, 0, message.size) } catch (e: Exception) { false }
+            }
+        }
+
+        internal object X25519Keys {
+            const val KEY_LENGTH = 32
+            fun publicKey(privateKey: ByteArray): ByteArray {
+                val pk = ByteArray(KEY_LENGTH)
+                X25519.generatePublicKey(privateKey, 0, pk, 0)
+                return pk
+            }
+            fun agree(privateKey: ByteArray, peerPublicKey: ByteArray): ByteArray? {
+                if (privateKey.size != KEY_LENGTH || peerPublicKey.size != KEY_LENGTH) return null
+                val out = ByteArray(KEY_LENGTH)
+                return if (X25519.calculateAgreement(privateKey, 0, peerPublicKey, 0, out, 0)) out else null
+            }
+        }
+        EOF
+
+    - name: Complete Config
+      run: |
+        mkdir -p app/src/main/assets
+        if [ -f docs/identity.example.json ]; then cp docs/identity.example.json app/src/main/assets/openhc-identity.json; fi
+        if [ -f identity.example.json ]; then cp identity.example.json app/src/main/assets/openhc-identity.json; fi
+
+    - uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+
+    - name: Build APK
+      run: |
+        chmod +x gradlew
+        ./gradlew assembleDebug
+
+    - name: Upload
+      uses: actions/upload-artifact@v4
+      with:
+        name: Final-Fixed-APK
+        path: "**/build/outputs/apk/debug/*.apk"
