@@ -15,8 +15,16 @@ jobs:
 
     - name: Inject Fixed AES Code
       run: |
-        # 这里直接指定了文件路径，避免乱找
-        cat << 'EOF' > core/auth/src/main/kotlin/io/github/gcbond/openhc/core/auth/crypto/AuthCrypto.kt
+        # 🔥 自动全盘搜索 AuthCrypto.kt 的位置
+        TARGET=$(find . -name "AuthCrypto.kt" | head -n 1)
+        if [ -z "$TARGET" ]; then
+          echo "❌ 失败：源码里根本找不到 AuthCrypto.kt！"
+          exit 1
+        fi
+        echo "✅ 找到文件路径: $TARGET"
+        
+        # 写入修复代码
+        cat << 'EOF' > $TARGET
         package io.github.gcbond.openhc.core.auth.crypto
 
         import org.bouncycastle.math.ec.rfc7748.X25519
